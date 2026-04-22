@@ -95,7 +95,7 @@ done
 
 The throughput **knee** is typically at concurrency 4 — past that, videos/s barely grows while per-video latency grows linearly. Plan production capacity at the knee.
 
-## Expected numbers (H200, 3 × 32-frame chunks, caches off)
+## Current numbers (H200, 3 × 32-frame chunks, caches off)
 
 | Concurrency | Videos/s | Per-video p50 |
 |---:|---:|---:|
