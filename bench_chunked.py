@@ -71,6 +71,28 @@ def pct(xs, p):
     return 0.0 if not xs else xs[max(0, min(len(xs)-1, int(round(p/100*(len(xs)-1)))))]
 
 
+async def start_profile(c: httpx.AsyncClient, base_url: str) -> None:
+    print("Starting profiler...")
+    profile_input = {"api_url": f"{base_url}/start_profile"}
+    print(f"profile_input: {profile_input}")
+    r = await c.post(profile_input["api_url"])
+    if r.status_code == 200:
+        print("Profiler started")
+    else:
+        print(f"Failed to start profiler: HTTP {r.status_code}")
+
+
+async def stop_profile(c: httpx.AsyncClient, base_url: str) -> None:
+    print("Stopping profiler...")
+    profile_input = {"api_url": f"{base_url}/stop_profile"}
+    print(f"profile_input: {profile_input}")
+    r = await c.post(profile_input["api_url"])
+    if r.status_code == 200:
+        print("Profiler stopped")
+    else:
+        print(f"Failed to stop profiler: HTTP {r.status_code}")
+
+
 async def run_video_serial(c, base, model, chunks, prompt, max_toks, capture=False):
     """Send chunks one after another. Wall-clock = sum of per-chunk E2E."""
     t0 = time.perf_counter()
@@ -94,6 +116,8 @@ async def run_video_parallel(c, base, model, chunks, prompt, max_toks, capture=F
 async def latency_mode(args, chunks):
     print(f"\n=== PER-CHUNK LATENCY (1 video, {len(chunks)} chunks, max_tokens={args.max_tokens}) ===")
     async with httpx.AsyncClient() as c:
+        if args.profile:
+            await start_profile(c, args.base_url)
         # First video serial — print per-chunk reply so user sees the model understood each chunk
         wall, per = await run_video_serial(c, args.base_url, args.model, chunks,
                                            args.prompt, args.max_tokens, capture=True)
@@ -111,6 +135,9 @@ async def latency_mode(args, chunks):
         print(f"  PARALLEL wall-clock per video = {wall_p:.2f}s  "
               f"(chunk TTFT p50/p99={pct(ttfts,50)*1000:.0f}/{pct(ttfts,99)*1000:.0f}ms, "
               f"E2E max={max(e2es):.2f}s)")
+
+        if args.profile:
+            await stop_profile(c, args.base_url)
 
 
 async def throughput_mode(args, chunks):
@@ -131,10 +158,14 @@ async def throughput_mode(args, chunks):
                         wall, per = await run_video_parallel(c, args.base_url, args.model, chunks,
                                                              args.prompt, args.max_tokens)
                     results.append((wall, per))
+        if args.profile:
+            await start_profile(c, args.base_url)
         t0 = time.perf_counter()
         tasks = [asyncio.create_task(worker()) for _ in range(args.concurrency)]
         await asyncio.gather(*tasks, return_exceptions=True)
         total_wall = time.perf_counter() - t0
+        if args.profile:
+            await stop_profile(c, args.base_url)
 
     ok_videos = [r for r in results if all(p.ok for p in r[1])]
     if not ok_videos:
@@ -167,6 +198,8 @@ async def main():
     p.add_argument("--duration", type=float, default=45.0)
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--prompt", default="Briefly describe what is happening in this video segment.")
+    p.add_argument("--profile", action="store_true",
+                   help="Enable nsys profiling via /start_profile and /stop_profile endpoints.")
     a = p.parse_args()
     chunks = [load_chunk(d) for d in sorted(glob.glob(f"{a.chunks_root}/chunk_*"))]
     if not chunks:
