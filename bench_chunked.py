@@ -2,22 +2,30 @@
 """
 Chunked-pipeline benchmark.
 
-Given a directory of chunk subdirs each containing frame JPEGs, this sends
-one chat request per chunk and measures:
-  - per-chunk latency (TTFT, E2E)
-  - per-video wall clock  (serial vs parallel firing of the chunks)
-  - throughput at various concurrent-video levels
+Three strategies for sending a video to the model:
 
-Matches the production pattern where a long video is pre-split into 16-s
-chunks sampled at 2 fps (e.g. 32 frames each), and each chunk gets its own
-model call.
+  serial   – pre-split chunks sent one after another (chunks-root required)
+  parallel – pre-split chunks fired concurrently    (chunks-root required)
+  whole    – entire video sent as a single video_url request (--video required;
+             vLLM handles frame extraction internally via --media-io-kwargs)
+
+All three modes report the same set of metrics so results are directly
+comparable:
+  latency mode   – TTFT, E2E, wall-clock per video (serial+parallel also show
+                   per-chunk breakdown)
+  throughput mode – videos/s, req/s, input tok/s, output tok/s, p50/p95/p99
+                   wall-clock per video
+
+For --strategy whole the server must be launched with:
+  --allowed-local-media-path <dir>   (if using a file:// URL)
+  --max-num-batched-tokens <N>       (>= num_frames * tokens_per_frame to avoid
+                                      running the vision encoder twice per req)
 """
 import argparse, asyncio, base64, glob, json, os, statistics, time
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import httpx
-
 
 def load_chunk(d: str) -> List[str]:
     out = []
@@ -26,19 +34,45 @@ def load_chunk(d: str) -> List[str]:
             out.append("data:image/jpeg;base64," + base64.b64encode(f.read()).decode())
     return out
 
+def video_file_url(path_or_url: str) -> str:
+    if path_or_url.startswith(("http://", "https://", "file://", "data:")):
+        return path_or_url
+    return "file://" + os.path.abspath(path_or_url)
 
 @dataclass
 class R:
     ok: bool; ttft: float = 0.0; e2e: float = 0.0
     input_tokens: int = 0; output_tokens: int = 0; err: str = ""; text: str = ""
 
-
 async def one(c, base, model, frames, prompt, max_toks, capture=False):
+    """Send one chat request with frames as image_url items."""
     body = {"model": model, "max_tokens": max_toks, "temperature": 0.0,
             "stream": True, "stream_options": {"include_usage": True},
-            "messages": [{"role":"user","content":
-                          [{"type":"text","text":prompt}] +
-                          [{"type":"image_url","image_url":{"url":f}} for f in frames]}]}
+            "messages": [{"role": "user", "content":
+                          [{"type": "text", "text": prompt}] +
+                          [{"type": "image_url", "image_url": {"url": f}} for f in frames]}]}
+    return await _post_streaming(c, base, body, capture)
+
+async def one_video(c, base, model, video_url, num_frames, prompt, max_toks, capture=False):
+    """Send one chat request with the full video as a video_url item.
+
+    num_frames is forwarded to vLLM's media_io_kwargs so the server samples
+    exactly that many frames uniformly.  Set num_frames=-1 to use the server
+    default.
+    """
+    media_kwargs = {} if num_frames == -1 else {"video": {"num_frames": num_frames}}
+    body = {"model": model, "max_tokens": max_toks, "temperature": 0.0,
+            "stream": True, "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "video_url", "video_url": {"url": video_url}},
+            ]}]}
+    if media_kwargs:
+        body["media_io_kwargs"] = media_kwargs
+    return await _post_streaming(c, base, body, capture)
+
+
+async def _post_streaming(c, base, body, capture):
     t0 = time.perf_counter(); ttft = None; inp = 0; out = 0; buf = []
     try:
         async with c.stream("POST", f"{base}/v1/chat/completions",
@@ -66,10 +100,26 @@ async def one(c, base, model, frames, prompt, max_toks, capture=False):
              input_tokens=inp, output_tokens=out, text="".join(buf))
 
 
-def pct(xs, p):
-    xs = sorted(xs)
-    return 0.0 if not xs else xs[max(0, min(len(xs)-1, int(round(p/100*(len(xs)-1)))))]
+async def run_video_serial(c, base, model, chunks, prompt, max_toks, capture=False):
+    t0 = time.perf_counter()
+    per_chunk: List[R] = []
+    for frames in chunks:
+        per_chunk.append(await one(c, base, model, frames, prompt, max_toks, capture))
+    return time.perf_counter() - t0, per_chunk
 
+
+async def run_video_parallel(c, base, model, chunks, prompt, max_toks, capture=False):
+    t0 = time.perf_counter()
+    tasks = [asyncio.create_task(one(c, base, model, f, prompt, max_toks, capture))
+             for f in chunks]
+    per_chunk: List[R] = await asyncio.gather(*tasks)
+    return time.perf_counter() - t0, per_chunk
+
+
+async def run_video_whole(c, base, model, video_url, num_frames, prompt, max_toks, capture=False):
+    t0 = time.perf_counter()
+    r = await one_video(c, base, model, video_url, num_frames, prompt, max_toks, capture)
+    return time.perf_counter() - t0, [r]
 
 async def start_profile(c: httpx.AsyncClient, base_url: str) -> None:
     print("Starting profiler...")
@@ -93,42 +143,68 @@ async def stop_profile(c: httpx.AsyncClient, base_url: str) -> None:
         print(f"Failed to stop profiler: HTTP {r.status_code}")
 
 
-async def run_video_serial(c, base, model, chunks, prompt, max_toks, capture=False):
-    """Send chunks one after another. Wall-clock = sum of per-chunk E2E."""
-    t0 = time.perf_counter()
-    per_chunk: List[R] = []
-    for frames in chunks:
-        per_chunk.append(await one(c, base, model, frames, prompt, max_toks, capture))
-    wall = time.perf_counter() - t0
-    return wall, per_chunk
+def pct(xs, p):
+    xs = sorted(xs)
+    return 0.0 if not xs else xs[max(0, min(len(xs)-1, int(round(p/100*(len(xs)-1)))))]
 
 
-async def run_video_parallel(c, base, model, chunks, prompt, max_toks, capture=False):
-    """Fire all chunks of one video concurrently. Wall-clock = max per-chunk E2E (+ scheduler queueing)."""
-    t0 = time.perf_counter()
-    tasks = [asyncio.create_task(one(c, base, model, f, prompt, max_toks, capture))
-             for f in chunks]
-    per_chunk: List[R] = await asyncio.gather(*tasks)
-    wall = time.perf_counter() - t0
-    return wall, per_chunk
+def _print_throughput(results, total_wall):
+    ok_videos = [r for r in results if all(p.ok for p in r[1])]
+    if not ok_videos:
+        print("  NO fully-OK videos")
+        for _, per in results[:2]:
+            for p in per:
+                if not p.ok: print(f"  err: {p.err}")
+        return
+    video_walls = [w for w, _ in ok_videos]
+    all_reqs    = [p for _, per in ok_videos for p in per]
+    tot_in  = sum(p.input_tokens  for p in all_reqs)
+    tot_out = sum(p.output_tokens for p in all_reqs)
+    print(f"  videos_ok={len(ok_videos)} (requests={len(all_reqs)}) wall={total_wall:.1f}s")
+    print(f"  videos/s        = {len(ok_videos)/total_wall:.2f}")
+    print(f"  req/s           = {len(all_reqs)/total_wall:.2f}")
+    print(f"  input  tok/s    = {tot_in/total_wall:.0f}")
+    print(f"  output tok/s    = {tot_out/total_wall:.0f}")
+    print(f"  per-video wall  p50/p95/p99 = "
+          f"{pct(video_walls,50):.2f} / {pct(video_walls,95):.2f} / {pct(video_walls,99):.2f} s")
 
 
 async def latency_mode(args, chunks):
+    if args.strategy == "whole":
+        print(f"\n=== WHOLE-VIDEO LATENCY (1 request, num_frames={args.num_frames}, "
+              f"max_tokens={args.max_tokens}) ===")
+        print(f"  video: {args.video_url}")
+        async with httpx.AsyncClient() as c:
+            if args.profile:
+                await start_profile(c, args.base_url)
+            wall, per = await run_video_whole(c, args.base_url, args.model, args.video_url,
+                                              args.num_frames, args.prompt, args.max_tokens,
+                                              capture=True)
+            r = per[0]
+            if r.ok:
+                print(f"  in_tok={r.input_tokens:5d} out_tok={r.output_tokens:4d} "
+                      f"TTFT={r.ttft*1000:6.1f}ms E2E={r.e2e:5.2f}s "
+                      f"wall={wall:.2f}s")
+                print(f"  -> {r.text.strip()[:240]!r}")
+            else:
+                print(f"  FAILED: {r.err}")
+            if args.profile:
+                await stop_profile(c, args.base_url)
+        return
+
     print(f"\n=== PER-CHUNK LATENCY (1 video, {len(chunks)} chunks, max_tokens={args.max_tokens}) ===")
     async with httpx.AsyncClient() as c:
         if args.profile:
             await start_profile(c, args.base_url)
-        # First video serial — print per-chunk reply so user sees the model understood each chunk
+
         wall, per = await run_video_serial(c, args.base_url, args.model, chunks,
                                            args.prompt, args.max_tokens, capture=True)
         for i, r in enumerate(per):
-            size = (r.input_tokens or 0)
-            print(f"  chunk {i}: in_tok={size:5d} out_tok={r.output_tokens:4d} "
+            print(f"  chunk {i}: in_tok={r.input_tokens:5d} out_tok={r.output_tokens:4d} "
                   f"TTFT={r.ttft*1000:6.1f}ms E2E={r.e2e:5.2f}s -> "
                   f"{r.text.strip()[:120]!r}")
         print(f"  SERIAL   wall-clock per video = {wall:.2f}s")
 
-        # Same video, parallel
         wall_p, per_p = await run_video_parallel(c, args.base_url, args.model, chunks,
                                                  args.prompt, args.max_tokens)
         ttfts = [r.ttft for r in per_p]; e2es = [r.e2e for r in per_p]
@@ -141,23 +217,40 @@ async def latency_mode(args, chunks):
 
 
 async def throughput_mode(args, chunks):
-    print(f"\n=== VIDEO THROUGHPUT (conc={args.concurrency} videos, dur={args.duration}s, "
-          f"strategy={args.strategy}, chunks_per_video={len(chunks)}) ===")
+    if args.strategy == "whole":
+        print(f"\n=== VIDEO THROUGHPUT (conc={args.concurrency} videos, dur={args.duration}s, "
+              f"strategy=whole, num_frames={args.num_frames}) ===")
+        conn_limit = args.concurrency * 2
+    else:
+        print(f"\n=== VIDEO THROUGHPUT (conc={args.concurrency} videos, dur={args.duration}s, "
+              f"strategy={args.strategy}, chunks_per_video={len(chunks)}) ===")
+        conn_limit = args.concurrency * len(chunks) * 2
+
     results: List[Tuple[float, List[R]]] = []
     stop_at = time.perf_counter() + args.duration
     sem = asyncio.Semaphore(args.concurrency)
-    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=args.concurrency*len(chunks)*2,
-                                                      max_keepalive_connections=args.concurrency*len(chunks)*2)) as c:
+
+    async with httpx.AsyncClient(limits=httpx.Limits(
+            max_connections=conn_limit,
+            max_keepalive_connections=conn_limit)) as c:
+
         async def worker():
             while time.perf_counter() < stop_at:
                 async with sem:
-                    if args.strategy == "serial":
-                        wall, per = await run_video_serial(c, args.base_url, args.model, chunks,
-                                                           args.prompt, args.max_tokens)
+                    if args.strategy == "whole":
+                        wall, per = await run_video_whole(
+                            c, args.base_url, args.model, args.video_url,
+                            args.num_frames, args.prompt, args.max_tokens)
+                    elif args.strategy == "serial":
+                        wall, per = await run_video_serial(
+                            c, args.base_url, args.model, chunks,
+                            args.prompt, args.max_tokens)
                     else:
-                        wall, per = await run_video_parallel(c, args.base_url, args.model, chunks,
-                                                             args.prompt, args.max_tokens)
+                        wall, per = await run_video_parallel(
+                            c, args.base_url, args.model, chunks,
+                            args.prompt, args.max_tokens)
                     results.append((wall, per))
+
         if args.profile:
             await start_profile(c, args.base_url)
         t0 = time.perf_counter()
@@ -167,44 +260,50 @@ async def throughput_mode(args, chunks):
         if args.profile:
             await stop_profile(c, args.base_url)
 
-    ok_videos = [r for r in results if all(p.ok for p in r[1])]
-    if not ok_videos:
-        print(" NO fully-OK videos")
-        for _, per in results[:2]:
-            for p in per:
-                if not p.ok: print(f"  err: {p.err}")
-        return
-    video_walls = [w for w, _ in ok_videos]
-    all_chunks = [p for _, per in ok_videos for p in per]
-    tot_in = sum(p.input_tokens for p in all_chunks)
-    tot_out = sum(p.output_tokens for p in all_chunks)
-    print(f"  videos_ok={len(ok_videos)} (chunks={len(all_chunks)}) wall={total_wall:.1f}s")
-    print(f"  videos/s        = {len(ok_videos)/total_wall:.2f}")
-    print(f"  chunk req/s     = {len(all_chunks)/total_wall:.2f}")
-    print(f"  input  tok/s    = {tot_in/total_wall:.0f}")
-    print(f"  output tok/s    = {tot_out/total_wall:.0f}")
-    print(f"  per-video wall  p50/p95/p99 = {pct(video_walls,50):.2f} / {pct(video_walls,95):.2f} / {pct(video_walls,99):.2f} s")
-
+    _print_throughput(results, total_wall)
 
 async def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--model", default="internvl3_5-8b")
-    p.add_argument("--chunks-root", default="./video_chunks")
-    p.add_argument("--mode", choices=["latency","throughput"], required=True)
-    p.add_argument("--strategy", choices=["serial","parallel"], default="parallel",
-                   help="how to fire chunks within a single video")
-    p.add_argument("--concurrency", type=int, default=1, help="concurrent videos in throughput mode")
-    p.add_argument("--duration", type=float, default=45.0)
+    p.add_argument("--mode", choices=["latency", "throughput"], required=True)
+    p.add_argument("--strategy", choices=["serial", "parallel", "whole"], default="parallel",
+                   help="serial/parallel: use pre-split frame chunks (--chunks-root); "
+                        "whole: send entire video as video_url (--video)")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="concurrent videos in throughput mode")
+    p.add_argument("--duration", type=float, default=45.0,
+                   help="throughput mode window in seconds")
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--prompt", default="Briefly describe what is happening in this video segment.")
     p.add_argument("--profile", action="store_true",
-                   help="Enable nsys profiling via /start_profile and /stop_profile endpoints.")
+                   help="enable nsys profiling via /start_profile and /stop_profile endpoints")
+
+    # chunk-based args
+    p.add_argument("--chunks-root", default="./video_chunks",
+                   help="directory of chunk_* subdirs (serial/parallel strategies)")
+
+    # whole-video args
+    p.add_argument("--video", default=None,
+                   help="video file path or URL for --strategy whole")
+    p.add_argument("--num-frames", type=int, default=32,
+                   help="frames to sample per video (whole strategy); -1 = server default")
+
     a = p.parse_args()
-    chunks = [load_chunk(d) for d in sorted(glob.glob(f"{a.chunks_root}/chunk_*"))]
-    if not chunks:
-        raise SystemExit(f"no chunks in {a.chunks_root}")
-    print(f"[loaded {len(chunks)} chunks, frame counts: {[len(c) for c in chunks]}]")
+
+    if a.strategy == "whole":
+        if not a.video:
+            p.error("--video is required when --strategy whole")
+        a.video_url = video_file_url(a.video)
+        chunks = []
+        print(f"[whole-video mode: {a.video_url}, num_frames={a.num_frames}]")
+    else:
+        a.video_url = None
+        chunks = [load_chunk(d) for d in sorted(glob.glob(f"{a.chunks_root}/chunk_*"))]
+        if not chunks:
+            raise SystemExit(f"no chunks found in {a.chunks_root}")
+        print(f"[loaded {len(chunks)} chunks, frame counts: {[len(c) for c in chunks]}]")
+
     if a.mode == "latency":
         await latency_mode(a, chunks)
     else:
