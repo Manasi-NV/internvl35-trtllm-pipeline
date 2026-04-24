@@ -16,6 +16,10 @@ comparable:
   throughput mode – videos/s, req/s, input tok/s, output tok/s, p50/p95/p99
                    wall-clock per video
 
+Dataset mode (--videos-dir):
+  Iterates over every .mp4 in the given folder using the whole strategy,
+  prints per-video metrics, then prints aggregate stats across the dataset.
+
 For --strategy whole the server must be launched with:
   --allowed-local-media-path <dir>   (if using a file:// URL)
   --max-num-batched-tokens <N>       (>= num_frames * tokens_per_frame to avoid
@@ -23,7 +27,7 @@ For --strategy whole the server must be launched with:
 """
 import argparse, asyncio, base64, glob, json, os, statistics, time
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import httpx
 
@@ -123,29 +127,27 @@ async def run_video_whole(c, base, model, video_url, num_frames, prompt, max_tok
 
 async def start_profile(c: httpx.AsyncClient, base_url: str) -> None:
     print("Starting profiler...")
-    profile_input = {"api_url": f"{base_url}/start_profile"}
-    print(f"profile_input: {profile_input}")
-    r = await c.post(profile_input["api_url"])
-    if r.status_code == 200:
-        print("Profiler started")
-    else:
-        print(f"Failed to start profiler: HTTP {r.status_code}")
+    r = await c.post(f"{base_url}/start_profile")
+    print("Profiler started" if r.status_code == 200 else f"Failed to start profiler: HTTP {r.status_code}")
 
 
 async def stop_profile(c: httpx.AsyncClient, base_url: str) -> None:
     print("Stopping profiler...")
-    profile_input = {"api_url": f"{base_url}/stop_profile"}
-    print(f"profile_input: {profile_input}")
-    r = await c.post(profile_input["api_url"])
-    if r.status_code == 200:
-        print("Profiler stopped")
-    else:
-        print(f"Failed to stop profiler: HTTP {r.status_code}")
+    r = await c.post(f"{base_url}/stop_profile")
+    print("Profiler stopped" if r.status_code == 200 else f"Failed to stop profiler: HTTP {r.status_code}")
 
 
 def pct(xs, p):
     xs = sorted(xs)
     return 0.0 if not xs else xs[max(0, min(len(xs)-1, int(round(p/100*(len(xs)-1)))))]
+
+
+def _print_aggregate(label: str, values: List[float], fmt: str = ".2f") -> None:
+    if not values:
+        return
+    mean = statistics.mean(values)
+    print(f"  {label:<18} mean={mean:{fmt}}  "
+          f"p50={pct(values,50):{fmt}}  p95={pct(values,95):{fmt}}  p99={pct(values,99):{fmt}}")
 
 
 def _print_throughput(results, total_wall):
@@ -168,6 +170,57 @@ def _print_throughput(results, total_wall):
     print(f"  per-video wall  p50/p95/p99 = "
           f"{pct(video_walls,50):.2f} / {pct(video_walls,95):.2f} / {pct(video_walls,99):.2f} s")
 
+async def dataset_mode(args, video_paths: List[str]) -> None:
+    print(f"\n=== DATASET LATENCY ({len(video_paths)} videos, "
+          f"num_frames={args.num_frames}, max_tokens={args.max_tokens}) ===")
+    print(f"  prompt: {args.prompt!r}\n")
+
+    # (name, wall, R)
+    rows: List[Tuple[str, float, R]] = []
+
+    async with httpx.AsyncClient() as c:
+        if args.profile:
+            await start_profile(c, args.base_url)
+
+        for path in video_paths:
+            name = os.path.basename(path)
+            url  = video_file_url(path)
+            wall, per = await run_video_whole(
+                c, args.base_url, args.model, url,
+                args.num_frames, args.prompt, args.max_tokens,
+                capture=True,
+            )
+            r = per[0]
+            rows.append((name, wall, r))
+            if r.ok:
+                print(f"  {name}")
+                print(f"    in_tok={r.input_tokens:5d}  out_tok={r.output_tokens:4d}  "
+                      f"TTFT={r.ttft*1000:7.1f}ms  E2E={r.e2e:6.2f}s  wall={wall:.2f}s")
+                if r.text:
+                    print(f"    -> {r.text.strip()[:160]!r}")
+            else:
+                print(f"  {name}  FAILED: {r.err}")
+
+        if args.profile:
+            await stop_profile(c, args.base_url)
+
+    ok = [(n, w, r) for n, w, r in rows if r.ok]
+    n_ok, n_total = len(ok), len(rows)
+    print(f"\n=== AGGREGATE ({n_ok}/{n_total} ok) ===")
+    if not ok:
+        return
+
+    ttfts_ms = [r.ttft * 1000 for _, _, r in ok]
+    e2es     = [r.e2e          for _, _, r in ok]
+    walls    = [w              for _, w, _ in ok]
+    in_toks  = [r.input_tokens  for _, _, r in ok]
+    out_toks = [r.output_tokens for _, _, r in ok]
+
+    _print_aggregate("TTFT (ms)",   ttfts_ms, fmt=".1f")
+    _print_aggregate("E2E (s)",     e2es)
+    _print_aggregate("wall (s)",    walls)
+    _print_aggregate("input tokens",  in_toks,  fmt=".0f")
+    _print_aggregate("output tokens", out_toks, fmt=".0f")
 
 async def latency_mode(args, chunks):
     if args.strategy == "whole":
@@ -266,10 +319,11 @@ async def main():
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--model", default="internvl3_5-8b")
-    p.add_argument("--mode", choices=["latency", "throughput"], required=True)
+    p.add_argument("--mode", choices=["latency", "throughput"],
+                   help="required unless --videos-dir is used")
     p.add_argument("--strategy", choices=["serial", "parallel", "whole"], default="parallel",
                    help="serial/parallel: use pre-split frame chunks (--chunks-root); "
-                        "whole: send entire video as video_url (--video)")
+                        "whole: send entire video as video_url (--video / --videos-dir)")
     p.add_argument("--concurrency", type=int, default=1,
                    help="concurrent videos in throughput mode")
     p.add_argument("--duration", type=float, default=45.0,
@@ -285,11 +339,29 @@ async def main():
 
     # whole-video args
     p.add_argument("--video", default=None,
-                   help="video file path or URL for --strategy whole")
+                   help="video file path or URL for --strategy whole (single video)")
+    p.add_argument("--videos-dir", default=None,
+                   help="directory of .mp4 files; iterate over all with whole strategy "
+                        "and report per-video + aggregate metrics (dataset mode)")
     p.add_argument("--num-frames", type=int, default=32,
                    help="frames to sample per video (whole strategy); -1 = server default")
 
     a = p.parse_args()
+
+    if a.videos_dir:
+        video_paths = sorted(
+            os.path.join(a.videos_dir, f)
+            for f in os.listdir(a.videos_dir)
+            if f.lower().endswith(".mp4")
+        )
+        if not video_paths:
+            raise SystemExit(f"no .mp4 files found in {a.videos_dir}")
+        print(f"[dataset mode: {len(video_paths)} videos in {a.videos_dir}]")
+        await dataset_mode(a, video_paths)
+        return
+
+    if not a.mode:
+        p.error("--mode is required when --videos-dir is not used")
 
     if a.strategy == "whole":
         if not a.video:
